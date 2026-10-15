@@ -65,18 +65,18 @@ def load_base_master_data():
     
     # Enrich entity metadata
     psu_keywords = ["sidbi", "rec", "pfc", "nabard", "nhai", "irfc", "ntpc", "sbi", "government of india", "goi", "g-sec", "gilt", "power grid"]
-    name_s = df.get("issuer_name", "").astype(str).str.lower()
-    sector_s = df.get("sector", "").astype(str).str.lower()
-    tax_s = df.get("tax_status", "").astype(str).str.lower()
-    rating_s = df.get("rating_current", "").astype(str).str.upper()
+    name_s = df["issuer_name"].astype(str).str.lower() if "issuer_name" in df.columns else pd.Series([""] * len(df))
+    sector_s = df["sector"].astype(str).str.lower() if "sector" in df.columns else pd.Series([""] * len(df))
+    tax_s = df["tax_status"].astype(str).str.lower() if "tax_status" in df.columns else pd.Series([""] * len(df))
+    rating_s = df["rating_current"].astype(str).str.upper() if "rating_current" in df.columns else pd.Series([""] * len(df))
 
     is_psu = (
-        name_s.apply(lambda n: any(k in n for k in psu_keywords)) |
-        tax_s.str.contains("54ec") |
-        sector_s.str.contains("psu") |
-        sector_s.str.contains("g-sec") |
-        rating_s.str.contains("SOVEREIGN")
-    )
+        name_s.apply(lambda n: any(k in str(n) for k in psu_keywords)) |
+        tax_s.str.contains("54ec", na=False) |
+        sector_s.str.contains("psu", na=False) |
+        sector_s.str.contains("g-sec", na=False) |
+        rating_s.str.contains("SOVEREIGN", na=False)
+    ).to_numpy()
     df["is_govt_psu"] = np.where(is_psu, "Yes", "No")
     return df
 
@@ -137,41 +137,62 @@ data = compute_derived_metrics(raw_data, user_tax_rate=tax_slab, benchmark_yield
 
 # Multi-Factor Weighted Buy Score (Vectorized 0 - 100)
 def compute_vectorized_buy_score(df: pd.DataFrame) -> pd.Series:
-    score = np.zeros(len(df), dtype=float)
+    n = len(df)
+    score = np.zeros(n, dtype=float)
 
     # 1. Yield Score (max 30 pts)
-    post_tax = df.get("post_tax_yield", df["current_yield_ytm"]).values
-    score += np.clip((post_tax / 8.0) * 30.0, 0.0, 30.0)
+    if "post_tax_yield" in df.columns:
+        ytm_series = pd.to_numeric(df["post_tax_yield"], errors="coerce").fillna(0.0)
+    elif "current_yield_ytm" in df.columns:
+        ytm_series = pd.to_numeric(df["current_yield_ytm"], errors="coerce").fillna(0.0)
+    else:
+        ytm_series = pd.Series(0.0, index=df.index)
+    score += np.clip((ytm_series.to_numpy(dtype=float) / 8.0) * 30.0, 0.0, 30.0)
 
     # 2. Rating Score (max 25 pts)
-    rating = df.get("rating_current", "").astype(str).str.upper().values
-    r_score = np.where(
-        np.char.find(rating.astype(str), "SOVEREIGN") >= 0, 25.0,
-        np.where(np.char.find(rating.astype(str), "AAA") >= 0, 23.0,
-                 np.where(np.char.find(rating.astype(str), "AA+") >= 0, 19.0,
-                          np.where(np.char.find(rating.astype(str), "AA") >= 0, 16.0,
-                                   np.where(np.char.find(rating.astype(str), "A+") >= 0, 10.0,
-                                            np.where(np.char.find(rating.astype(str), "A") >= 0, 7.0, 2.0))))))
-    score += r_score
+    rating = df["rating_current"].astype(str).str.upper() if "rating_current" in df.columns else pd.Series([""] * n, index=df.index)
+    r_conditions = [
+        rating.str.contains("SOVEREIGN", na=False).to_numpy(),
+        rating.str.contains("AAA", na=False).to_numpy(),
+        rating.str.contains(r"AA\+", na=False).to_numpy(),
+        rating.str.contains("AA", na=False).to_numpy(),
+        rating.str.contains(r"A\+", na=False).to_numpy(),
+        rating.str.contains("A", na=False).to_numpy(),
+    ]
+    r_choices = [25.0, 23.0, 19.0, 16.0, 10.0, 7.0]
+    score += np.select(r_conditions, r_choices, default=2.0)
 
     # 3. Security & Collateral (max 15 pts)
-    sec = df.get("secured_unsecured", "").astype(str).str.capitalize().values
-    score += np.where(np.char.find(sec.astype(str), "Secured") >= 0, 15.0,
-                      np.where(np.char.find(sec.astype(str), "Sovereign") >= 0, 15.0, 5.0))
+    sec = df["secured_unsecured"].astype(str).str.lower() if "secured_unsecured" in df.columns else pd.Series([""] * n, index=df.index)
+    sec_conditions = [
+        sec.str.contains("secured", na=False).to_numpy(),
+        sec.str.contains("sovereign", na=False).to_numpy(),
+    ]
+    sec_choices = [15.0, 15.0]
+    score += np.select(sec_conditions, sec_choices, default=5.0)
 
     # 4. Government / PSU Backing (max 15 pts)
-    is_psu = (df.get("is_govt_psu", "No") == "Yes").values
+    if "is_govt_psu" in df.columns:
+        is_psu = (df["is_govt_psu"].astype(str) == "Yes").to_numpy()
+    else:
+        is_psu = np.zeros(n, dtype=bool)
     score += np.where(is_psu, 15.0, 5.0)
 
     # 5. Liquidity Flag (max 10 pts)
-    liq = df.get("liquidity_flag", "Low").values
+    if "liquidity_flag" in df.columns:
+        liq = df["liquidity_flag"].astype(str).to_numpy()
+    else:
+        liq = np.full(n, "Low")
     score += np.where(liq == "High", 10.0, np.where(liq == "Medium", 6.0, 2.0))
 
     # 6. Tenor Sweet-spot (max 5 pts)
-    tenor = df.get("remaining_tenor_years", 1.0).values
+    if "remaining_tenor_years" in df.columns:
+        tenor = pd.to_numeric(df["remaining_tenor_years"], errors="coerce").fillna(1.0).to_numpy(dtype=float)
+    else:
+        tenor = np.ones(n, dtype=float)
     score += np.where((tenor >= 1.0) & (tenor <= 5.0), 5.0, np.where((tenor > 5.0) & (tenor <= 10.0), 4.0, 2.0))
 
-    return np.round(score, 1)
+    return pd.Series(np.round(score, 1), index=df.index)
 
 data["buy_score"] = compute_vectorized_buy_score(data)
 
@@ -201,31 +222,31 @@ min_adv = st.sidebar.slider("Min Avg Daily Volume (₹ Cr)", 0.0, 50.0, 0.0, 1.0
 mask = np.ones(len(data), dtype=bool)
 if search_query:
     q = search_query.lower()
-    t_match = data["ticker"].astype(str).str.lower().str.contains(q) if "ticker" in data.columns else False
-    i_match = data["issuer_name"].astype(str).str.lower().str.contains(q)
-    isin_match = data["isin"].astype(str).str.lower().str.contains(q)
-    mask &= (t_match | i_match | isin_match)
+    t_match = data["ticker"].astype(str).str.lower().str.contains(q, na=False) if "ticker" in data.columns else pd.Series(False, index=data.index)
+    i_match = data["issuer_name"].astype(str).str.lower().str.contains(q, na=False) if "issuer_name" in data.columns else pd.Series(False, index=data.index)
+    isin_match = data["isin"].astype(str).str.lower().str.contains(q, na=False) if "isin" in data.columns else pd.Series(False, index=data.index)
+    mask &= (t_match | i_match | isin_match).to_numpy(dtype=bool)
 if sectors:
-    mask &= data['sector'].isin(sectors)
+    mask &= data['sector'].isin(sectors).to_numpy(dtype=bool)
 if sec_filter:
-    mask &= data['secured_unsecured'].isin(sec_filter)
+    mask &= data['secured_unsecured'].isin(sec_filter).to_numpy(dtype=bool)
 if pay_freq:
-    mask &= data['payment_frequency'].isin(pay_freq)
+    mask &= data['payment_frequency'].isin(pay_freq).to_numpy(dtype=bool)
 if exchanges:
-    mask &= data['exchange'].isin(exchanges)
+    mask &= data['exchange'].isin(exchanges).to_numpy(dtype=bool)
 if rating_current:
-    mask &= data['rating_current'].isin(rating_current)
+    mask &= data['rating_current'].isin(rating_current).to_numpy(dtype=bool)
 if psu_filter:
-    mask &= data['is_govt_psu'].isin(psu_filter)
+    mask &= data['is_govt_psu'].isin(psu_filter).to_numpy(dtype=bool)
 if tax_status:
-    mask &= data['tax_status'].isin(tax_status)
+    mask &= data['tax_status'].isin(tax_status).to_numpy(dtype=bool)
 
-mask &= (data['current_yield_ytm'] >= ytm_range[0]) & (data['current_yield_ytm'] <= ytm_range[1])
-mask &= (data['remaining_tenor_years'] >= tenor_range[0]) & (data['remaining_tenor_years'] <= tenor_range[1])
+mask &= ((data['current_yield_ytm'] >= ytm_range[0]) & (data['current_yield_ytm'] <= ytm_range[1])).to_numpy(dtype=bool)
+mask &= ((data['remaining_tenor_years'] >= tenor_range[0]) & (data['remaining_tenor_years'] <= tenor_range[1])).to_numpy(dtype=bool)
 if ignore_sub_12m:
-    mask &= (data['remaining_tenor_years'] >= 1.0)
+    mask &= (data['remaining_tenor_years'] >= 1.0).to_numpy(dtype=bool)
 if min_adv > 0.0:
-    mask &= (data['daily_value_inr_cr'] >= min_adv)
+    mask &= (data['daily_value_inr_cr'] >= min_adv).to_numpy(dtype=bool)
 
 filtered = data[mask].copy()
 

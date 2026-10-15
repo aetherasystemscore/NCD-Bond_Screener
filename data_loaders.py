@@ -302,20 +302,21 @@ def compute_derived_metrics(df: pd.DataFrame, user_tax_rate: float = 0.0, benchm
     data['credit_spread_bps'] = ((data['current_yield_ytm'] - benchmark_yield) * 100).round().astype(int)
 
     # 7. Risk Bucketing
-    ratings = data.get('rating_current', '').astype(str).str.upper()
-    sec = data.get('secured_unsecured', '').astype(str).str.capitalize()
-    sector = data.get('sector', '').astype(str).str.lower()
-    seniority = data.get('seniority', '').astype(str).str.capitalize()
+    ratings = data['rating_current'].astype(str).str.upper() if 'rating_current' in data.columns else pd.Series([""] * len(data), index=data.index)
+    sec = data['secured_unsecured'].astype(str).str.capitalize() if 'secured_unsecured' in data.columns else pd.Series([""] * len(data), index=data.index)
+    sector = data['sector'].astype(str).str.lower() if 'sector' in data.columns else pd.Series([""] * len(data), index=data.index)
+    seniority = data['seniority'].astype(str).str.capitalize() if 'seniority' in data.columns else pd.Series([""] * len(data), index=data.index)
 
-    is_sovereign = ratings.str.contains('SOVEREIGN') | sector.str.contains('g-sec') | sector.str.contains('gilt')
-    is_prime_rating = ratings.str.contains('AAA') | ratings.str.contains(r'AA\+')
-    is_secured = sec.str.contains('Secured') | seniority.str.contains('Senior')
+    is_sovereign = (ratings.str.contains('SOVEREIGN', na=False) | sector.str.contains('g-sec', na=False) | sector.str.contains('gilt', na=False)).to_numpy(dtype=bool)
+    is_prime_rating = (ratings.str.contains('AAA', na=False) | ratings.str.contains(r'AA\+', na=False)).to_numpy(dtype=bool)
+    is_secured = (sec.str.contains('Secured', na=False) | seniority.str.contains('Senior', na=False)).to_numpy(dtype=bool)
+    has_a = ratings.str.contains('A', na=False).to_numpy(dtype=bool)
 
     data['risk_bucket'] = np.where(
         is_sovereign, "Sovereign / G-Sec (Zero Default Risk)",
         np.where(is_prime_rating & is_secured, "Prime AAA/AA+ Secured",
                  np.where(is_prime_rating, "Prime Unsecured / Tier-II",
-                          np.where(ratings.str.contains('A'), "Moderate Yield A-Rated", "High Yield / Credit Risk")))
+                          np.where(has_a, "Moderate Yield A-Rated", "High Yield / Credit Risk")))
     )
 
     # 8. Fast Vectorized Duration & Convexity
@@ -336,20 +337,21 @@ def compute_derived_metrics(df: pd.DataFrame, user_tax_rate: float = 0.0, benchm
     ).round(2)
 
     # 10. Volume & Liquidity Categorization with Stale-Trade Detection
-    data['avg_daily_volume_cr'] = data.get('daily_value_inr_cr', 0.0).fillna(0.0).round(2)
+    data['avg_daily_volume_cr'] = data.get('daily_value_inr_cr', pd.Series(0.0, index=data.index)).fillna(0.0).round(2)
     val = data['avg_daily_volume_cr']
-    trades = data.get('num_trades', 0).fillna(0).astype(int)
+    trades = data.get('num_trades', pd.Series(0, index=data.index)).fillna(0).astype(int)
 
-    is_high = (val >= 20.0) | (trades >= 100)
-    is_med = (val >= 5.0) | (trades >= 30)
-    is_mod = (val >= 1.0)
+    is_high = ((val >= 20.0) | (trades >= 100)).to_numpy(dtype=bool)
+    is_med = ((val >= 5.0) | (trades >= 30)).to_numpy(dtype=bool)
+    is_mod = (val >= 1.0).to_numpy(dtype=bool)
 
     data['liquidity_flag'] = np.where(is_high, "High", np.where(is_med, "Medium", "Low"))
+    val_str = val.astype(str)
     data['volume_indicator'] = np.where(
-        is_high, "🟢 High (₹ " + val.astype(str) + " Cr)",
-        np.where(is_med, "🟡 Medium (₹ " + val.astype(str) + " Cr)",
-                 np.where(is_mod, "🟠 Moderate (₹ " + val.astype(str) + " Cr)",
-                          "⚪ Low (₹ " + val.astype(str) + " Cr)"))
+        is_high, "🟢 High (₹ " + val_str + " Cr)",
+        np.where(is_med, "🟡 Medium (₹ " + val_str + " Cr)",
+                 np.where(is_mod, "🟠 Moderate (₹ " + val_str + " Cr)",
+                          "⚪ Low (₹ " + val_str + " Cr)"))
     )
 
     return data
