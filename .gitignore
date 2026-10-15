@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.streamlit_reboot
+.DS_Store
+.vscode/
+.idea/
