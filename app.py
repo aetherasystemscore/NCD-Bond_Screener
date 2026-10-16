@@ -172,13 +172,24 @@ def compute_vectorized_buy_score(df: pd.DataFrame) -> pd.Series:
 
     # 2. Rating Score (max 25 pts)
     rating = df["rating_current"].astype(str).str.upper() if "rating_current" in df.columns else pd.Series([""] * n, index=df.index)
+    clean_rating = (
+        rating.str.replace("CRISIL", "", regex=False)
+              .str.replace("ICRA", "", regex=False)
+              .str.replace("CARE", "", regex=False)
+              .str.replace("IND-RA", "", regex=False)
+              .str.replace("IND", "", regex=False)
+              .str.replace("BRICKWORK", "", regex=False)
+              .str.replace("ACUITE", "", regex=False)
+              .str.strip()
+    )
     r_conditions = [
-        rating.str.contains("SOVEREIGN", na=False).to_numpy(),
-        rating.str.contains("AAA", na=False).to_numpy(),
-        rating.str.contains(r"AA\+", na=False).to_numpy(),
-        rating.str.contains("AA", na=False).to_numpy(),
-        rating.str.contains("A", na=False).to_numpy(),
-        rating.str.contains("BBB", na=False).to_numpy(),
+        clean_rating.str.contains("SOVEREIGN", na=False).to_numpy(),
+        clean_rating.str.contains("AAA", na=False).to_numpy(),
+        clean_rating.str.contains(r"AA\+", na=False).to_numpy(),
+        clean_rating.str.contains("AA", na=False).to_numpy(),
+        clean_rating.str.contains(r"A(?:\+|-|\b)", na=False).to_numpy(),
+        clean_rating.str.contains("BBB", na=False).to_numpy(),
+        clean_rating.str.contains("BB", na=False).to_numpy(),
     ]
     r_choices = [25.0, 23.0, 19.0, 16.0, 10.0, 7.0, 4.0]
     score += np.select(r_conditions, r_choices, default=2.0)
@@ -228,11 +239,15 @@ psu_filter = st.sidebar.multiselect("Govt / PSU Entity", options=["Yes", "No"])
 tax_status = st.sidebar.multiselect("Tax Status", options=sorted(data['tax_status'].dropna().unique()))
 
 st.sidebar.markdown("---")
-min_ytm = float(data['current_yield_ytm'].min())
-max_ytm = float(data['current_yield_ytm'].max())
+min_ytm = float(data['current_yield_ytm'].min()) if not data.empty and not pd.isna(data['current_yield_ytm'].min()) else 0.0
+max_ytm = float(data['current_yield_ytm'].max()) if not data.empty and not pd.isna(data['current_yield_ytm'].max()) else 15.0
+if min_ytm >= max_ytm:
+    max_ytm = min_ytm + 1.0
 ytm_range = st.sidebar.slider("Current YTM (%)", min_ytm, max_ytm, (min_ytm, max_ytm), step=0.1)
 
-max_tenor = float(data['remaining_tenor_years'].max())
+max_tenor = float(data['remaining_tenor_years'].max()) if not data.empty and not pd.isna(data['remaining_tenor_years'].max()) else 10.0
+if max_tenor <= 0.0:
+    max_tenor = 10.0
 tenor_range = st.sidebar.slider("Tenor (Years)", 0.0, max_tenor, (0.0, max_tenor), step=0.5)
 
 st.sidebar.markdown("---")
