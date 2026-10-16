@@ -310,6 +310,32 @@ with tab_screener:
 
     st.markdown("---")
 
+    with st.expander("💡 Financial Concept Guide: Clean Price vs. Accrued Interest vs. Dirty Price", expanded=False):
+        c_exp1, c_exp2, c_exp3 = st.columns(3)
+        with c_exp1:
+            st.markdown("""
+            ##### 🏷️ Clean Price (Quoted LTP)
+            - **Definition**: The market price quoted on exchange order books (NSE/BSE) and broker terminals (Zerodha, Groww, etc.).
+            - **Scope**: Represents the **pure capital value** of future principal repayments and coupons, **excluding** any interest accumulated since the last coupon payout.
+            - **Why it is used**: If quotes included daily accumulated interest, prices would artificially drift upward every day and plunge on payout dates. Quoting Clean Price isolates genuine capital gains/losses.
+            """)
+        with c_exp2:
+            st.markdown("""
+            ##### ⏳ Accrued Interest (AI)
+            - **Definition**: The coupon interest accumulated from the **last coupon payment date** up to today's settlement date.
+            - **Rationale**: When you buy midway through a coupon cycle, the issuer pays the upcoming full coupon to you. However, the seller held the bond for the elapsed days and is legally entitled to that partial interest.
+            - **Formula**:
+              $$\\text{Accrued Interest} = \\text{Face Value} \\times \\frac{\\text{Coupon Rate}}{100} \\times \\frac{\\text{Days Elapsed}}{\\text{Days in Period}}$$
+            """)
+        with c_exp3:
+            st.markdown("""
+            ##### 💰 Dirty Price (Settlement / Cash Price)
+            - **Definition**: The **actual total rupee amount** the buyer pays (and the seller receives) upon trade settlement:
+              $$\\mathbf{Dirty\\ Price} = \\mathbf{Clean\\ Price} + \\mathbf{Accrued\\ Interest}$$
+            - **Why it matters for YTM**: Cashflow discount models **must solve YTM using Dirty Price**, because Dirty Price represents your true initial cash outflow ($t=0$) to acquire all future cashflows.
+            """)
+        st.info("📌 **Concrete Example**: Suppose an NCD has Face Value = ₹1,000 and pays a 10% annual coupon on Dec 31. On June 30 (~182 days later), the exchange quotes a **Clean Price of ₹1,010**. Exactly half a year of coupon has accumulated (₹50). To buy this bond, your total cash settlement outlay (**Dirty Price**) is **₹1,010 + ₹50 = ₹1,060**.")
+
     display_cols = [
         "ticker", "issuer_name", "isin",
         "current_yield_ytm", "secured_unsecured", "payment_frequency",
@@ -330,15 +356,15 @@ with tab_screener:
             "ticker": st.column_config.TextColumn("Ticker", help="NSE/BSE Trading Symbol", width="small"),
             "issuer_name": st.column_config.TextColumn("Bond Title / Issue Name", width="large"),
             "isin": st.column_config.TextColumn("ISIN", help="12-digit International Securities Identification Number", width="medium"),
-            "current_yield_ytm": st.column_config.NumberColumn("Gross YTM (%)", format="%.2f%%", help="Pre-tax / gross yield to maturity"),
+            "current_yield_ytm": st.column_config.NumberColumn("Gross YTM (%)", format="%.2f%%", help="Pre-tax / gross yield to maturity solved from Dirty Price"),
             "secured_unsecured": st.column_config.TextColumn("Security", width="small", help="Whether Secured, Unsecured, or Sovereign Guarantee"),
             "payment_frequency": st.column_config.TextColumn("Payout Freq", width="small", help="Interest payout frequency (Annual, Semi-Annual, Monthly, etc.)"),
             "coupon_rate": st.column_config.NumberColumn("Coupon (%)", format="%.2f%%"),
             "rating_current": st.column_config.TextColumn("Rating", width="small"),
             "remaining_tenor_display": st.column_config.TextColumn("Tenor Left", width="small"),
-            "last_traded_price": st.column_config.NumberColumn("Clean Price (₹)", format="₹ %.2f", help="Exchange Traded Clean Price"),
-            "accrued_interest": st.column_config.NumberColumn("Accrued Int (₹)", format="₹ %.2f", help="Accrued interest since last coupon date"),
-            "dirty_price": st.column_config.NumberColumn("Dirty Price (₹)", format="₹ %.2f", help="Actual settlement price (Clean Price + Accrued Interest)"),
+            "last_traded_price": st.column_config.NumberColumn("Clean Price (₹)", format="₹ %.2f", help="Exchange-quoted price excluding accrued interest (order book LTP)"),
+            "accrued_interest": st.column_config.NumberColumn("Accrued Int (₹)", format="₹ %.2f", help="Interest accumulated from last coupon date up to today payable to the seller"),
+            "dirty_price": st.column_config.NumberColumn("Dirty Price (₹)", format="₹ %.2f", help="Total settlement price you actually pay = Clean Price + Accrued Interest. Used to solve YTM."),
             "credit_spread_bps": st.column_config.NumberColumn("Spread (bps)", help=f"Yield spread over 10Y Sovereign G-Sec ({active_benchmark:.2f}%)"),
             "post_tax_yield": st.column_config.NumberColumn("Post-Tax (%)", format="%.2f%%", help="Yield realized after deducting user tax slab"),
             "pre_tax_equiv_yield": st.column_config.NumberColumn("PTEY (%)", format="%.2f%%", help="Pre-Tax Equivalent Yield (apple-to-apple comparison with taxable FDs)"),
@@ -520,7 +546,14 @@ with tab_manage:
                     index=5 if "T-Bill" in inst_type or coupon_rate == 0.0 else (1 if "G-Sec" in inst_type or "SDL" in inst_type else 0),
                     help="Interest payout frequency"
                 )
-                clean_price = st.number_input("Last Traded Clean Price (₹) *", min_value=1.0, max_value=500000.0, value=float(face_value), step=0.5)
+                clean_price = st.number_input(
+                    "Last Traded Clean Price (₹) *",
+                    min_value=1.0,
+                    max_value=500000.0,
+                    value=float(face_value),
+                    step=0.5,
+                    help="Quoted exchange market price excluding accrued interest (order book LTP). The screener will automatically calculate Accrued Interest and Dirty Price (settlement price) to solve the exact cashflow YTM."
+                )
                 stated_ytm = st.number_input("Stated YTM (%) [Optional]", min_value=0.0, max_value=30.0, value=0.0, step=0.05, help="Leave 0.0 to auto-calculate exact YTM from clean price and tenor")
 
             st.markdown("##### Maturity, Dates & Credit Rating")
