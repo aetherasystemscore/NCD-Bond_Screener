@@ -1,11 +1,14 @@
 import pandas as pd
 import numpy as np
 from datetime import datetime, date
-import requests
 import re
-from scipy.optimize import brentq
 import io
 import zipfile
+import urllib.request
+try:
+    import requests
+except ImportError:
+    requests = None
 
 # Default benchmark based on current 10Y Indian Sovereign Yield (can be fetched live)
 BENCHMARK_10Y_GSEC_DEFAULT = 7.39
@@ -27,10 +30,19 @@ def get_live_10y_gsec_yield(fallback: float = BENCHMARK_10Y_GSEC_DEFAULT) -> tup
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
+    html_text = ""
     try:
-        r = requests.get('https://tradingeconomics.com/india/government-bond-yield', headers=headers, timeout=3.5)
-        if r.status_code == 200:
-            match = re.search(r'id=[\"\']market_last[\"\'][^>]*>([0-9\.]+)</span>', r.text)
+        if requests is not None:
+            r = requests.get('https://tradingeconomics.com/india/government-bond-yield', headers=headers, timeout=3.5)
+            if r.status_code == 200:
+                html_text = r.text
+        else:
+            req = urllib.request.Request('https://tradingeconomics.com/india/government-bond-yield', headers=headers)
+            with urllib.request.urlopen(req, timeout=3.5) as resp:
+                html_text = resp.read().decode('utf-8', errors='ignore')
+
+        if html_text:
+            match = re.search(r'id=[\"\']market_last[\"\'][^>]*>([0-9\.]+)</span>', html_text)
             if match:
                 y = round(float(match.group(1)), 2)
                 if 4.0 <= y <= 15.0:
@@ -130,10 +142,46 @@ def calculate_ytm_from_price(dirty_price: float, face_value: float, coupon_rate:
         pv = c * np.sum(discount) + face_value * discount[-1]
         return pv - dirty_price
 
+    # Pure Python / NumPy Bisection Root Finder (Zero dependency on scipy)
+    y_solved = None
     try:
+        from scipy.optimize import brentq
         y_solved = brentq(price_diff, 0.0001, 1.0, xtol=1e-5)
-        return round(float(y_solved * 100.0), 2)
     except Exception:
+        pass
+
+    if y_solved is None:
+        try:
+            low, high = 0.0001, 1.0
+            f_low = price_diff(low)
+            f_high = price_diff(high)
+            if f_low * f_high > 0:
+                for upper in [2.0, 5.0, 10.0]:
+                    high = upper
+                    f_high = price_diff(high)
+                    if f_low * f_high <= 0:
+                        break
+            if f_low * f_high <= 0:
+                for _ in range(60):
+                    mid = (low + high) / 2.0
+                    f_mid = price_diff(mid)
+                    if abs(f_mid) < 1e-5 or (high - low) / 2.0 < 1e-6:
+                        y_solved = mid
+                        break
+                    if (f_low > 0 and f_mid > 0) or (f_low < 0 and f_mid < 0):
+                        low = mid
+                        f_low = f_mid
+                    else:
+                        high = mid
+                        f_high = f_mid
+                if y_solved is None:
+                    y_solved = (low + high) / 2.0
+        except Exception:
+            y_solved = None
+
+    if y_solved is not None and not np.isnan(y_solved):
+        return round(float(y_solved * 100.0), 2)
+    else:
         # Standard bond-equivalent yield approximation fallback
         approx_y = (c * m + (face_value - dirty_price) / tenor_years) / ((face_value + dirty_price) / 2.0)
         return round(float(max(0.0, approx_y * 100.0)), 2)
