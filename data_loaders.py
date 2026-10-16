@@ -104,11 +104,21 @@ def calculate_accrued_interest(face_value: float, coupon_rate: float, freq: str,
 def calculate_ytm_from_price(dirty_price: float, face_value: float, coupon_rate: float, tenor_years: float, freq: str = "Annual") -> float:
     """
     Solves for annualized Yield to Maturity (YTM %) using Brent's root-finding method on Dirty Price.
+    Supports coupon-paying bonds as well as zero-coupon T-Bills / deep discount bonds.
     """
     if tenor_years <= 0 or dirty_price <= 0 or face_value <= 0:
         return 0.0
 
     fl = str(freq).lower()
+
+    # Analytical solution for zero-coupon instruments (T-Bills, Zero-Coupon NCDs, Deep Discount Bonds)
+    if coupon_rate <= 0.0 or "zero" in fl or "t-bill" in fl:
+        try:
+            ytm_val = ((face_value / dirty_price) ** (1.0 / tenor_years) - 1.0) * 100.0
+            return round(float(max(0.0, ytm_val)), 2)
+        except Exception:
+            return 0.0
+
     m = 2 if "semi" in fl else (12 if "month" in fl else (4 if "quarter" in fl else 1))
     n = max(1, int(round(tenor_years * m)))
     c = (coupon_rate / 100.0) * face_value / m
@@ -307,16 +317,25 @@ def compute_derived_metrics(df: pd.DataFrame, user_tax_rate: float = 0.0, benchm
     sector = data['sector'].astype(str).str.lower() if 'sector' in data.columns else pd.Series([""] * len(data), index=data.index)
     seniority = data['seniority'].astype(str).str.capitalize() if 'seniority' in data.columns else pd.Series([""] * len(data), index=data.index)
 
-    is_sovereign = (ratings.str.contains('SOVEREIGN', na=False) | sector.str.contains('g-sec', na=False) | sector.str.contains('gilt', na=False)).to_numpy(dtype=bool)
-    is_prime_rating = (ratings.str.contains('AAA', na=False) | ratings.str.contains(r'AA\+', na=False)).to_numpy(dtype=bool)
+    is_sovereign = (
+        ratings.str.contains('SOVEREIGN', na=False) |
+        sector.str.contains('g-sec', na=False) |
+        sector.str.contains('gilt', na=False) |
+        sector.str.contains('sdl', na=False) |
+        sector.str.contains('state development', na=False) |
+        sector.str.contains('t-bill', na=False) |
+        sector.str.contains('treasury', na=False) |
+        sec.str.contains('sovereign', na=False)
+    ).to_numpy(dtype=bool)
+    is_prime_rating = ratings.str.contains(r'AAA|AA\+|AA|AA\-', regex=True, na=False).to_numpy(dtype=bool)
     is_secured = (sec.str.contains('Secured', na=False) | seniority.str.contains('Senior', na=False)).to_numpy(dtype=bool)
-    has_a = ratings.str.contains('A', na=False).to_numpy(dtype=bool)
+    is_a_rating = (ratings.str.contains(r'A\+|A\-|\bA\b', regex=True, na=False) & ~ratings.str.contains('AA', na=False)).to_numpy(dtype=bool)
 
     data['risk_bucket'] = np.where(
         is_sovereign, "Sovereign / G-Sec (Zero Default Risk)",
         np.where(is_prime_rating & is_secured, "Prime AAA/AA+ Secured",
                  np.where(is_prime_rating, "Prime Unsecured / Tier-II",
-                          np.where(has_a, "Moderate Yield A-Rated", "High Yield / Credit Risk")))
+                          np.where(is_a_rating, "Moderate Yield A-Rated", "High Yield / Credit Risk")))
     )
 
     # 8. Fast Vectorized Duration & Convexity

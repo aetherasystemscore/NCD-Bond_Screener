@@ -4,12 +4,14 @@ import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
 import os
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from data_loaders import (
     load_sample_csv,
     compute_derived_metrics,
     get_live_10y_gsec_yield,
     ingest_bhavcopy,
+    calculate_accrued_interest,
+    calculate_ytm_from_price,
     BENCHMARK_10Y_GSEC_DEFAULT
 )
 
@@ -52,6 +54,14 @@ st.markdown("""
 
 CSV_FILE_PATH = "data/sample_bonds.csv"
 
+def save_master_bonds_data(df: pd.DataFrame):
+    """Saves updated dataframe to master CSV locations and updates session state."""
+    df.to_csv("data/sample_bonds.csv", index=False)
+    if os.path.exists("bonds_data.csv"):
+        df.to_csv("bonds_data.csv", index=False)
+    st.session_state["active_bonds_df"] = df
+    st.cache_data.clear()
+
 # 1. Fetch Live Sovereign Benchmark
 live_benchmark_yield, benchmark_source = get_live_10y_gsec_yield()
 
@@ -59,12 +69,20 @@ live_benchmark_yield, benchmark_source = get_live_10y_gsec_yield()
 @st.cache_data(ttl=900)
 def load_base_master_data():
     if not os.path.exists(CSV_FILE_PATH):
-        st.error(f"Dataset not found at `{CSV_FILE_PATH}`.")
-        st.stop()
-    df = load_sample_csv(CSV_FILE_PATH)
+        if os.path.exists("bonds_data.csv"):
+            df = load_sample_csv("bonds_data.csv")
+        else:
+            st.error(f"Dataset not found at `{CSV_FILE_PATH}`.")
+            st.stop()
+    else:
+        df = load_sample_csv(CSV_FILE_PATH)
     
     # Enrich entity metadata
-    psu_keywords = ["sidbi", "rec", "pfc", "nabard", "nhai", "irfc", "ntpc", "sbi", "government of india", "goi", "g-sec", "gilt", "power grid"]
+    psu_keywords = [
+        "sidbi", "rec", "pfc", "nabard", "nhai", "irfc", "ntpc", "sbi",
+        "government of india", "goi", "g-sec", "gilt", "power grid",
+        "state development", "sdl", "t-bill", "treasury bill", "rbi"
+    ]
     name_s = df["issuer_name"].astype(str).str.lower() if "issuer_name" in df.columns else pd.Series([""] * len(df))
     sector_s = df["sector"].astype(str).str.lower() if "sector" in df.columns else pd.Series([""] * len(df))
     tax_s = df["tax_status"].astype(str).str.lower() if "tax_status" in df.columns else pd.Series([""] * len(df))
@@ -75,6 +93,9 @@ def load_base_master_data():
         tax_s.str.contains("54ec", na=False) |
         sector_s.str.contains("psu", na=False) |
         sector_s.str.contains("g-sec", na=False) |
+        sector_s.str.contains("sdl", na=False) |
+        sector_s.str.contains("t-bill", na=False) |
+        sector_s.str.contains("treasury", na=False) |
         rating_s.str.contains("SOVEREIGN", na=False)
     ).to_numpy()
     df["is_govt_psu"] = np.where(is_psu, "Yes", "No")
@@ -156,10 +177,10 @@ def compute_vectorized_buy_score(df: pd.DataFrame) -> pd.Series:
         rating.str.contains("AAA", na=False).to_numpy(),
         rating.str.contains(r"AA\+", na=False).to_numpy(),
         rating.str.contains("AA", na=False).to_numpy(),
-        rating.str.contains(r"A\+", na=False).to_numpy(),
         rating.str.contains("A", na=False).to_numpy(),
+        rating.str.contains("BBB", na=False).to_numpy(),
     ]
-    r_choices = [25.0, 23.0, 19.0, 16.0, 10.0, 7.0]
+    r_choices = [25.0, 23.0, 19.0, 16.0, 10.0, 7.0, 4.0]
     score += np.select(r_conditions, r_choices, default=2.0)
 
     # 3. Security & Collateral (max 15 pts)
@@ -255,7 +276,7 @@ tab_screener, tab_yield_curve, tab_stress_test, tab_manage = st.tabs([
     "📊 Bond Screener & Analytics", 
     "📈 Yield Curve & Spread Matrix",
     "⚡ RBI Rate Shock Stress-Tester",
-    "📥 Live Bhavcopy & Management"
+    "📥 Add Bonds & Market Operations"
 ])
 
 with tab_screener:
@@ -275,10 +296,12 @@ with tab_screener:
     st.markdown("---")
 
     display_cols = [
-        "ticker", "issuer_name", "isin", "issue_date", "maturity_date", "remaining_tenor_display",
-        "payment_frequency", "rating_current", "secured_unsecured", "coupon_rate",
+        "ticker", "issuer_name", "isin",
+        "current_yield_ytm", "secured_unsecured", "payment_frequency",
+        "coupon_rate", "rating_current", "remaining_tenor_display",
         "last_traded_price", "accrued_interest", "dirty_price",
-        "current_yield_ytm", "credit_spread_bps", "post_tax_yield", "pre_tax_equiv_yield",
+        "credit_spread_bps", "post_tax_yield", "pre_tax_equiv_yield",
+        "issue_date", "maturity_date",
         "volume_indicator", "avg_daily_volume_cr",
         "modified_duration", "convexity", "tax_status", "is_govt_psu", "liquidity_flag", "buy_score"
     ]
@@ -292,20 +315,20 @@ with tab_screener:
             "ticker": st.column_config.TextColumn("Ticker", help="NSE/BSE Trading Symbol", width="small"),
             "issuer_name": st.column_config.TextColumn("Bond Title / Issue Name", width="large"),
             "isin": st.column_config.TextColumn("ISIN", help="12-digit International Securities Identification Number", width="medium"),
-            "issue_date": st.column_config.TextColumn("Issue Date", width="small"),
-            "maturity_date": st.column_config.TextColumn("Maturity Date", width="small"),
-            "remaining_tenor_display": st.column_config.TextColumn("Tenor Left", width="small"),
-            "payment_frequency": st.column_config.TextColumn("Payout Freq", width="small"),
-            "rating_current": st.column_config.TextColumn("Rating", width="small"),
-            "secured_unsecured": st.column_config.TextColumn("Security", width="small"),
+            "current_yield_ytm": st.column_config.NumberColumn("Gross YTM (%)", format="%.2f%%", help="Pre-tax / gross yield to maturity"),
+            "secured_unsecured": st.column_config.TextColumn("Security", width="small", help="Whether Secured, Unsecured, or Sovereign Guarantee"),
+            "payment_frequency": st.column_config.TextColumn("Payout Freq", width="small", help="Interest payout frequency (Annual, Semi-Annual, Monthly, etc.)"),
             "coupon_rate": st.column_config.NumberColumn("Coupon (%)", format="%.2f%%"),
+            "rating_current": st.column_config.TextColumn("Rating", width="small"),
+            "remaining_tenor_display": st.column_config.TextColumn("Tenor Left", width="small"),
             "last_traded_price": st.column_config.NumberColumn("Clean Price (₹)", format="₹ %.2f", help="Exchange Traded Clean Price"),
             "accrued_interest": st.column_config.NumberColumn("Accrued Int (₹)", format="₹ %.2f", help="Accrued interest since last coupon date"),
             "dirty_price": st.column_config.NumberColumn("Dirty Price (₹)", format="₹ %.2f", help="Actual settlement price (Clean Price + Accrued Interest)"),
-            "current_yield_ytm": st.column_config.NumberColumn("Gross YTM (%)", format="%.2f%%", help="Pre-tax / gross yield to maturity"),
             "credit_spread_bps": st.column_config.NumberColumn("Spread (bps)", help=f"Yield spread over 10Y Sovereign G-Sec ({active_benchmark:.2f}%)"),
             "post_tax_yield": st.column_config.NumberColumn("Post-Tax (%)", format="%.2f%%", help="Yield realized after deducting user tax slab"),
             "pre_tax_equiv_yield": st.column_config.NumberColumn("PTEY (%)", format="%.2f%%", help="Pre-Tax Equivalent Yield (apple-to-apple comparison with taxable FDs)"),
+            "issue_date": st.column_config.TextColumn("Issue Date", width="small"),
+            "maturity_date": st.column_config.TextColumn("Maturity Date", width="small"),
             "volume_indicator": st.column_config.TextColumn("Volume Indication", width="medium"),
             "avg_daily_volume_cr": st.column_config.NumberColumn("ADV (₹ Cr)", format="₹ %.2f Cr", width="small"),
             "modified_duration": st.column_config.NumberColumn("Mod Dur (Yrs)", format="%.2f"),
@@ -425,39 +448,312 @@ with tab_stress_test:
         )
 
 with tab_manage:
-    st.subheader("📥 Live Bhavcopy Ingestion & Master Management")
-    
-    col_u1, col_u2 = st.columns([2, 1])
-    with col_u1:
-        st.markdown("""
-        **Update Market Quotes via Official Exchange Bhavcopy**:
-        Drop today's official daily debt Bhavcopy from **NSE** (`sec_bhavdata_full_DDMMYYYY.csv`) or **BSE** (`DEBT_YYYYMMDD.zip` / CSV).
-        The screener will match ISINs, update Clean LTP, daily trade volumes, recalculate dynamic accrued interest, dirty prices, and re-solve YTM.
-        """)
-        uploaded_bhav = st.file_uploader("Upload NSE / BSE Debt Bhavcopy (CSV or ZIP)", type=["csv", "zip"])
-        if uploaded_bhav is not None:
-            updated_master, msg = ingest_bhavcopy(uploaded_bhav, st.session_state["active_bonds_df"])
-            st.session_state["active_bonds_df"] = updated_master
-            st.session_state["bond_last_sync"] = datetime.now().strftime("%d-%b-%Y %H:%M:%S")
-            st.success(msg)
-            if st.button("Apply and Rerun Screener"):
+    st.subheader("📥 Add Bonds & Master Database Management")
+    st.caption("Add new NCDs, G-Secs, SDLs, or T-Bills (>1 year tenor), upload bulk CSVs, or ingest official daily exchange Bhavcopies.")
+
+    subtab_add, subtab_bulk, subtab_bhavcopy, subtab_directory = st.tabs([
+        "➕ Add New Security (NCD / G-Sec / SDL / T-Bill)",
+        "📤 Bulk CSV Import & Template",
+        "🔄 Daily Bhavcopy & Benchmark",
+        "📂 Master Security Directory"
+    ])
+
+    with subtab_add:
+        st.markdown("#### ➕ Add an Individual Debt Security")
+        st.info("💡 **Tenor Policy**: Only securities with **more than 1 year (> 365 days) remaining to maturity** can be added. The screener will automatically compute dynamic Accrued Interest, Dirty Price, YTM, Macaulay/Modified Duration, Convexity, and Buy Score.")
+
+        with st.form("add_bond_single_form", clear_on_submit=False):
+            f_col1, f_col2, f_col3 = st.columns(3)
+            with f_col1:
+                inst_type = st.selectbox(
+                    "Instrument Classification",
+                    options=["Corporate NCD", "Government of India G-Sec", "State Development Loan (SDL)", "Treasury Bill (T-Bill)", "InvIT / Infra Bond", "Tax-Free PSU Bond"],
+                    help="Categorization of the debt instrument"
+                )
+                ticker = st.text_input("Ticker Symbol *", placeholder="e.g. 1125MML27, 690GOI65, 771UP46-SG", help="NSE / BSE trading symbol").strip().upper()
+                exchange = st.selectbox("Exchange", ["NSE", "BSE", "Both"])
+                face_value = st.number_input("Face Value (₹)", min_value=10.0, max_value=1000000.0, value=100.0 if "G-Sec" in inst_type or "SDL" in inst_type or "T-Bill" in inst_type else 1000.0, step=100.0)
+
+            with f_col2:
+                isin = st.text_input("ISIN (12 Characters) *", placeholder="e.g. INE05F407EC8 or IN0020250018", help="International Securities Identification Number").strip().upper()
+                issuer_name = st.text_input("Issuer / Bond Title *", placeholder="e.g. Muthoot Mercantile Ltd 11.25% NCD 2027")
+                
+                sector = st.selectbox(
+                    "Sector",
+                    options=["NBFC / Financials", "G-Sec / Sovereign", "State Development Loan (SDL)", "Treasury / Sovereign", "PSU / Railways", "PSU / Power NBFC", "PSU / Infra NBFC", "Banking", "Infrastructure / InvIT", "Housing Finance", "Fintech / Retail", "Corporate / Conglomerate", "Other"],
+                    index=1 if "G-Sec" in inst_type else (2 if "SDL" in inst_type else (3 if "T-Bill" in inst_type else 0))
+                )
+                secured_unsecured = st.selectbox(
+                    "Secured or Unsecured *",
+                    options=["Secured", "Unsecured", "Sovereign Guarantee"],
+                    index=2 if "G-Sec" in inst_type or "SDL" in inst_type or "T-Bill" in inst_type else 0,
+                    help="Prominently tracked in screener"
+                )
+
+            with f_col3:
+                coupon_rate = st.number_input(
+                    "Coupon Rate (%) *",
+                    min_value=0.0,
+                    max_value=25.0,
+                    value=0.0 if "T-Bill" in inst_type else 8.50,
+                    step=0.05,
+                    help="Enter 0.0 for T-Bills or Zero Coupon Bonds"
+                )
+                payment_frequency = st.selectbox(
+                    "Payment Frequency *",
+                    options=["Annual", "Semi-Annual", "Quarterly", "Monthly", "Cumulative", "At Maturity (Zero Coupon / T-Bill)"],
+                    index=5 if "T-Bill" in inst_type or coupon_rate == 0.0 else (1 if "G-Sec" in inst_type or "SDL" in inst_type else 0),
+                    help="Interest payout frequency"
+                )
+                clean_price = st.number_input("Last Traded Clean Price (₹) *", min_value=1.0, max_value=500000.0, value=float(face_value), step=0.5)
+                stated_ytm = st.number_input("Stated YTM (%) [Optional]", min_value=0.0, max_value=30.0, value=0.0, step=0.05, help="Leave 0.0 to auto-calculate exact YTM from clean price and tenor")
+
+            st.markdown("##### Maturity, Dates & Credit Rating")
+            d_col1, d_col2, d_col3, d_col4 = st.columns(4)
+            with d_col1:
+                issue_date = st.date_input("Issue Date", value=date.today() - timedelta(days=365))
+            with d_col2:
+                maturity_date = st.date_input("Maturity Date *", value=date.today() + timedelta(days=365 * 3))
+            with d_col3:
+                rating_default = 0 if "G-Sec" in inst_type or "SDL" in inst_type or "T-Bill" in inst_type else 1
+                rating_current = st.selectbox("Rating", ["SOVEREIGN", "AAA", "AA+", "AA", "AA-", "A+", "A", "BBB+", "BBB", "Unrated"], index=rating_default)
+                rating_agency = st.selectbox("Rating Agency", ["RBI/Govt", "CRISIL", "ICRA", "CARE", "India Ratings", "BWR", "Other"], index=0 if rating_current == "SOVEREIGN" else 1)
+            with d_col4:
+                tax_status = st.selectbox("Tax Status", ["Taxable", "Tax-free", "54EC"], index=1 if "Tax-Free" in inst_type else 0)
+                seniority = st.selectbox("Seniority", ["Senior", "Subordinated / Tier-II", "Perpetual"])
+
+            st.markdown("##### Liquidity & Volume Estimates")
+            l_col1, l_col2, l_col3 = st.columns(3)
+            with l_col1:
+                daily_volume_cr = st.number_input("Est. Avg Daily Volume (₹ Cr)", min_value=0.0, value=25.0 if "G-Sec" in inst_type else 2.0, step=0.5)
+            with l_col2:
+                daily_trades = st.number_input("Est. Number of Trades", min_value=0, value=150 if "G-Sec" in inst_type else 25, step=5)
+            with l_col3:
+                issue_size_cr = st.number_input("Issue Size (₹ Cr)", min_value=1.0, value=5000.0 if "G-Sec" in inst_type else 500.0, step=50.0)
+
+            submit_bond = st.form_submit_button("💾 Validate & Add Security to Screener", use_container_width=True)
+
+        if submit_bond:
+            if not ticker or not isin:
+                st.error("❌ Both **Ticker** and **ISIN** are required fields.")
+            elif len(isin) != 12:
+                st.error(f"❌ Invalid ISIN length: '{isin}' is {len(isin)} characters. Standard Indian ISINs must be exactly 12 characters (e.g., INE05F407EC8 or IN0020250018).")
+            elif not issuer_name:
+                st.error("❌ **Issuer / Bond Title** cannot be empty.")
+            else:
+                today_d = date.today()
+                days_left = (maturity_date - today_d).days
+                tenor_years = round(days_left / 365.25, 2)
+
+                if days_left <= 365:
+                    st.error(
+                        f"❌ **Maturity Policy Violation**: Security matures on {maturity_date.strftime('%d-%b-%Y')} "
+                        f"({days_left} days left = {tenor_years:.2f} years). "
+                        f"Only securities with **more than 1 year (> 365 days) remaining to mature** can be added. "
+                        f"Please choose a maturity date on or after {(today_d + timedelta(days=366)).strftime('%d-%b-%Y')}."
+                    )
+                else:
+                    accrued = calculate_accrued_interest(face_value, coupon_rate, payment_frequency, issue_date, maturity_date, today_d)
+                    dirty_price = round(clean_price + accrued, 2)
+                    
+                    if stated_ytm > 0:
+                        solved_ytm = float(stated_ytm)
+                    else:
+                        solved_ytm = calculate_ytm_from_price(dirty_price, face_value, coupon_rate, tenor_years, payment_frequency)
+
+                    is_t_bill = "t-bill" in inst_type.lower() or "t-bill" in sector.lower() or coupon_rate == 0.0
+                    c_type = "Zero" if is_t_bill else "Fixed"
+
+                    new_row = {
+                        "ticker": ticker.strip().upper(),
+                        "isin": isin.strip().upper(),
+                        "issuer_name": issuer_name.strip(),
+                        "sector": sector,
+                        "exchange": exchange,
+                        "listing_status": "Listed",
+                        "face_value": float(face_value),
+                        "coupon_rate": float(coupon_rate),
+                        "coupon_type": c_type,
+                        "current_yield_ytm": float(solved_ytm),
+                        "last_traded_price": float(clean_price),
+                        "accrued_interest": float(accrued),
+                        "issue_date": issue_date.strftime("%Y-%m-%d"),
+                        "maturity_date": maturity_date.strftime("%Y-%m-%d"),
+                        "payment_frequency": payment_frequency,
+                        "repayment_mode": "Bullet",
+                        "call_put_option": "No",
+                        "premature_withdrawal_allowed": "No",
+                        "rating_current": rating_current,
+                        "rating_agency": rating_agency,
+                        "rating_outlook": "Stable",
+                        "rating_date": today_d.strftime("%Y-%m-%d"),
+                        "secured_unsecured": secured_unsecured,
+                        "seniority": seniority,
+                        "security_cover_ratio": 1.0 if "sovereign" in secured_unsecured.lower() else (1.2 if "secured" in secured_unsecured.lower() else 0.0),
+                        "daily_volume_units": float(daily_volume_cr * 10000000.0 / clean_price) if clean_price > 0 else 1000.0,
+                        "daily_value_inr_cr": float(daily_volume_cr),
+                        "num_trades": int(daily_trades),
+                        "issue_size_inr_cr": float(issue_size_cr),
+                        "outstanding_inr_cr": float(issue_size_cr),
+                        "tax_status": tax_status,
+                        "tds_applicable": "No" if "sovereign" in secured_unsecured.lower() or tax_status == "Tax-free" else "Yes",
+                        "min_investment_units": 1 if face_value >= 1000 else 10,
+                        "lot_size": 1 if face_value >= 1000 else 10,
+                        "last_traded_date": today_d.strftime("%Y-%m-%d")
+                    }
+
+                    curr_df = st.session_state["active_bonds_df"].copy()
+                    if "isin" in curr_df.columns and (curr_df["isin"] == isin).any():
+                        idx = curr_df[curr_df["isin"] == isin].index[0]
+                        for k, v in new_row.items():
+                            curr_df.at[idx, k] = v
+                        action_msg = "Updated existing security"
+                    else:
+                        new_df = pd.DataFrame([new_row])
+                        curr_df = pd.concat([curr_df, new_df], ignore_index=True)
+                        action_msg = "Added new security"
+
+                    save_master_bonds_data(curr_df)
+                    st.success(
+                        f"✅ **{action_msg} Successfully!**\n\n"
+                        f"• **Ticker**: `{ticker}` | **ISIN**: `{isin}`\n"
+                        f"• **Issuer**: {issuer_name}\n"
+                        f"• **Gross YTM**: **{solved_ytm:.2f}%**\n"
+                        f"• **Security**: **{secured_unsecured}**\n"
+                        f"• **Payment Frequency**: **{payment_frequency}**\n"
+                        f"• **Remaining Tenor**: **{tenor_years:.2f} Years** ({days_left} days)\n"
+                        f"• **Dirty Price**: ₹ {dirty_price:.2f} (Clean: ₹ {clean_price:.2f} + Accrued: ₹ {accrued:.2f})"
+                    )
+                    st.rerun()
+
+    with subtab_bulk:
+        st.markdown("#### 📤 Bulk Add Securities via CSV")
+        st.caption("Upload a CSV file containing multiple NCDs, G-Secs, SDLs, or T-Bills. Securities with tenor <= 1 year will be automatically flagged/skipped.")
+        
+        template_df = pd.DataFrame([{
+            "ticker": "EXAMPLE_NCD28",
+            "isin": "INE123A07010",
+            "issuer_name": "Example Finance Ltd 9.00% NCD 2028",
+            "sector": "NBFC / Financials",
+            "exchange": "NSE",
+            "listing_status": "Listed",
+            "face_value": 1000.0,
+            "coupon_rate": 9.0,
+            "coupon_type": "Fixed",
+            "current_yield_ytm": 8.95,
+            "last_traded_price": 1002.5,
+            "accrued_interest": 12.0,
+            "issue_date": "2024-01-01",
+            "maturity_date": (date.today() + timedelta(days=365 * 3)).strftime("%Y-%m-%d"),
+            "payment_frequency": "Annual",
+            "repayment_mode": "Bullet",
+            "call_put_option": "No",
+            "premature_withdrawal_allowed": "No",
+            "rating_current": "AA+",
+            "rating_agency": "CRISIL",
+            "rating_outlook": "Stable",
+            "rating_date": "2024-01-01",
+            "secured_unsecured": "Secured",
+            "seniority": "Senior",
+            "security_cover_ratio": 1.2,
+            "daily_volume_units": 5000,
+            "daily_value_inr_cr": 5.0,
+            "num_trades": 50,
+            "issue_size_inr_cr": 500.0,
+            "outstanding_inr_cr": 500.0,
+            "tax_status": "Taxable",
+            "tds_applicable": "Yes",
+            "min_investment_units": 1,
+            "lot_size": 1,
+            "last_traded_date": date.today().strftime("%Y-%m-%d")
+        }])
+        st.download_button(
+            "📥 Download CSV Template for Bond Additions",
+            data=template_df.to_csv(index=False).encode("utf-8"),
+            file_name="bonds_import_template.csv",
+            mime="text/csv"
+        )
+        
+        uploaded_csv = st.file_uploader("Upload CSV with new securities", type=["csv"], key="bulk_bond_uploader")
+        if uploaded_csv is not None:
+            try:
+                bulk_df = pd.read_csv(uploaded_csv)
+                if "isin" not in bulk_df.columns:
+                    st.error("Uploaded CSV must have an `isin` column.")
+                else:
+                    today_ts = pd.to_datetime(date.today())
+                    mat_ts = pd.to_datetime(bulk_df["maturity_date"], errors="coerce")
+                    days_remaining = (mat_ts - today_ts).dt.days
+
+                    valid_mask = days_remaining > 365
+                    dropped_count = int((~valid_mask).sum())
+                    valid_df = bulk_df[valid_mask].copy()
+
+                    if dropped_count > 0:
+                        st.warning(f"⚠️ Skipped {dropped_count} security/securities with tenor <= 1 year (mandate requires > 1 year to mature).")
+
+                    if not valid_df.empty:
+                        curr = st.session_state["active_bonds_df"].copy()
+                        combined = pd.concat([curr[~curr["isin"].isin(valid_df["isin"])], valid_df], ignore_index=True)
+                        save_master_bonds_data(combined)
+                        st.success(f"✅ Successfully ingested {len(valid_df)} securities with > 1 year tenor into master database!")
+                        if st.button("Apply Bulk Additions and Rerun"):
+                            st.rerun()
+                    else:
+                        st.error("No valid securities with tenor > 1 year found in the uploaded file.")
+            except Exception as ex:
+                st.error(f"Error parsing bulk CSV: {ex}")
+
+    with subtab_bhavcopy:
+        col_u1, col_u2 = st.columns([2, 1])
+        with col_u1:
+            st.markdown("""
+            **Update Market Quotes via Official Exchange Bhavcopy**:
+            Drop today's official daily debt Bhavcopy from **NSE** (`sec_bhavdata_full_DDMMYYYY.csv`) or **BSE** (`DEBT_YYYYMMDD.zip` / CSV).
+            The screener will match ISINs, update Clean LTP, daily trade volumes, recalculate dynamic accrued interest, dirty prices, and re-solve YTM.
+            """)
+            uploaded_bhav = st.file_uploader("Upload NSE / BSE Debt Bhavcopy (CSV or ZIP)", type=["csv", "zip"])
+            if uploaded_bhav is not None:
+                updated_master, msg = ingest_bhavcopy(uploaded_bhav, st.session_state["active_bonds_df"])
+                save_master_bonds_data(updated_master)
+                st.session_state["bond_last_sync"] = datetime.now().strftime("%d-%b-%Y %H:%M:%S")
+                st.success(msg)
+                if st.button("Apply and Rerun Screener"):
+                    st.rerun()
+
+        with col_u2:
+            st.markdown("**Sovereign Benchmark Override**")
+            custom_bm = st.number_input(
+                "10Y Benchmark G-Sec Yield (%)",
+                min_value=4.0,
+                max_value=12.0,
+                value=float(st.session_state["custom_benchmark_yield"]),
+                step=0.01,
+                help="Override or test different benchmark levels"
+            )
+            if custom_bm != st.session_state["custom_benchmark_yield"]:
+                st.session_state["custom_benchmark_yield"] = custom_bm
+                st.toast(f"Benchmark updated to {custom_bm:.2f}%", icon="🎯")
                 st.rerun()
 
-    with col_u2:
-        st.markdown("**Sovereign Benchmark Override**")
-        custom_bm = st.number_input(
-            "10Y Benchmark G-Sec Yield (%)",
-            min_value=4.0,
-            max_value=12.0,
-            value=float(st.session_state["custom_benchmark_yield"]),
-            step=0.01,
-            help="Override or test different benchmark levels"
-        )
-        if custom_bm != st.session_state["custom_benchmark_yield"]:
-            st.session_state["custom_benchmark_yield"] = custom_bm
-            st.toast(f"Benchmark updated to {custom_bm:.2f}%", icon="🎯")
-            st.rerun()
+    with subtab_directory:
+        st.markdown("#### 📂 Master Active Securities Directory")
+        st.caption(f"Total securities active in screener: **{len(st.session_state['active_bonds_df'])}**")
+        
+        del_col1, del_col2 = st.columns([3, 1])
+        with del_col1:
+            all_bonds_list = [f"{r['ticker']} - {r['isin']} - {r['issuer_name']}" for _, r in st.session_state["active_bonds_df"].iterrows()]
+            selected_bond_to_del = st.selectbox("Select Security to Remove (Optional)", options=["None"] + all_bonds_list)
+        with del_col2:
+            st.write("")
+            st.write("")
+            if selected_bond_to_del != "None":
+                del_isin = selected_bond_to_del.split(" - ")[1]
+                if st.button("🗑️ Remove Security", type="secondary"):
+                    curr = st.session_state["active_bonds_df"]
+                    curr = curr[curr["isin"] != del_isin].reset_index(drop=True)
+                    save_master_bonds_data(curr)
+                    st.success(f"Removed {selected_bond_to_del} from database.")
+                    st.rerun()
 
-    st.markdown("---")
-    st.subheader("📂 Active Bond Master Database")
-    st.dataframe(st.session_state["active_bonds_df"], use_container_width=True)
+        st.dataframe(st.session_state["active_bonds_df"], use_container_width=True)
