@@ -276,15 +276,22 @@ def compute_derived_metrics(df: pd.DataFrame, user_tax_rate: float = 0.0, benchm
     data['dirty_price'] = (data['last_traded_price'] + data['accrued_interest']).round(2)
 
     # 4. Solved YTM vs Stated YTM
-    # If current_yield_ytm is missing or user has custom dirty prices, root finder can solve YTM
-    if 'current_yield_ytm' not in data.columns or data['current_yield_ytm'].isna().any():
-        solved_ytm = [
-            calculate_ytm_from_price(data['dirty_price'].iloc[i], face_vals[i], coupons[i], data['remaining_tenor_years'].iloc[i], freqs[i])
-            for i in range(len(data))
-        ]
-        data['current_yield_ytm'] = solved_ytm
-    else:
-        data['current_yield_ytm'] = data['current_yield_ytm'].astype(float).round(2)
+    # Dynamically compute mathematically accurate YTM from clean price (last_traded_price)
+    solved_ytm = []
+    for i in range(len(data)):
+        clean_p = float(data['last_traded_price'].iloc[i]) if 'last_traded_price' in data.columns else 0.0
+        c_val = coupons[i]
+        fv_val = face_vals[i]
+        tenor_val = data['remaining_tenor_years'].iloc[i]
+        freq_val = freqs[i]
+        if clean_p > 0 and tenor_val > 0:
+            y = calculate_ytm_from_price(clean_p, fv_val, c_val, tenor_val, freq_val)
+            solved_ytm.append(y)
+        elif 'current_yield_ytm' in data.columns and not pd.isna(data['current_yield_ytm'].iloc[i]):
+            solved_ytm.append(round(float(data['current_yield_ytm'].iloc[i]), 2))
+        else:
+            solved_ytm.append(0.0)
+    data['current_yield_ytm'] = solved_ytm
 
     # 5. Post-Tax Yield & Pre-Tax Equivalent Yield (PTEY)
     # Tax-Free bonds (IRFC, PFC, REC, NHAI under Sec 10(15)(iv)(h)) have 0% tax on coupon
@@ -451,6 +458,133 @@ def ingest_bhavcopy(file_obj_or_path, master_df: pd.DataFrame) -> tuple[pd.DataF
         return updated_master, f"Successfully merged {matched_count} active debt quotes from Bhavcopy."
     except Exception as e:
         return master_df, f"Error processing Bhavcopy: {e}"
+
+def ingest_zerodha_holdings(file_obj_or_text, master_df: pd.DataFrame) -> tuple[pd.DataFrame, str, pd.DataFrame]:
+    """
+    Ingests Zerodha Kite holdings export (CSV file, copy-pasted TSV/text, or JSON),
+    extracts Instrument symbols, LTP, Average Cost, Qty, and Cur. Val.
+    Updates matched bonds in master database with live LTP, auto-detects amortized face values,
+    recalculates dynamic accrued interest, dirty price, and YTM.
+    Returns (updated_master_df, status_message, audit_summary_df).
+    """
+    try:
+        raw_text = ""
+        if hasattr(file_obj_or_text, 'read'):
+            content = file_obj_or_text.read()
+            if hasattr(file_obj_or_text, 'seek'):
+                file_obj_or_text.seek(0)
+            if isinstance(content, bytes):
+                raw_text = content.decode('utf-8', errors='ignore')
+            else:
+                raw_text = str(content)
+        else:
+            raw_text = str(file_obj_or_text)
+
+        lines = [l.strip() for l in raw_text.strip().splitlines() if l.strip()]
+        if not lines:
+            return master_df, "Uploaded holdings file or input is empty.", pd.DataFrame()
+
+        # Find header line (containing 'instrument' or 'symbol')
+        header_idx = 0
+        for idx, line in enumerate(lines[:10]):
+            if any(k in line.lower() for k in ['instrument', 'symbol', 'tradingsymbol']):
+                header_idx = idx
+                break
+
+        relevant_text = "\n".join(lines[header_idx:])
+        delimiter = '\t' if '\t' in lines[header_idx] else ','
+        kdf = pd.read_csv(io.StringIO(relevant_text), sep=delimiter)
+
+        def clean_num(v):
+            if pd.isna(v):
+                return 0.0
+            s = re.sub(r'[^\d\.\-]', '', str(v))
+            try:
+                return float(s)
+            except Exception:
+                return 0.0
+
+        cols_lower = {c: c.lower().strip() for c in kdf.columns}
+        inst_col = next((c for c, l in cols_lower.items() if any(k in l for k in ['instrument', 'symbol', 'tradingsymbol'])), None)
+        if not inst_col:
+            return master_df, "Could not find 'Instrument' column in Zerodha data.", pd.DataFrame()
+
+        ltp_col = next((c for c, l in cols_lower.items() if 'ltp' in l or 'last' in l), None)
+        avg_col = next((c for c, l in cols_lower.items() if 'avg' in l or 'cost' in l or 'buy' in l), None)
+        qty_col = next((c for c, l in cols_lower.items() if 'qty' in l or 'quantity' in l), None)
+        val_col = next((c for c, l in cols_lower.items() if 'cur' in l or 'val' in l), None)
+
+        updated_master = master_df.copy()
+        matched_count = 0
+        audit_rows = []
+        today_d = date.today()
+
+        for _, row in kdf.iterrows():
+            sym = str(row[inst_col]).strip().upper()
+            if not sym or sym == 'NAN':
+                continue
+
+            ltp_val = clean_num(row[ltp_col]) if ltp_col else 0.0
+            avg_val = clean_num(row[avg_col]) if avg_col else 0.0
+            qty_val = clean_num(row[qty_col]) if qty_col else 0.0
+            cur_val = clean_num(row[val_col]) if val_col else 0.0
+
+            eff_price = ltp_val if ltp_val > 0 else avg_val
+            if eff_price <= 0:
+                continue
+
+            # Match against master database ticker or ISIN
+            mask = (updated_master['ticker'].astype(str).str.upper() == sym) | (updated_master['isin'].astype(str).str.upper() == sym)
+            if not mask.any():
+                sym_clean = sym.split('-')[0]
+                mask = updated_master['ticker'].astype(str).str.upper().str.startswith(sym_clean)
+
+            if not mask.any():
+                continue
+
+            idx = updated_master[mask].index[0]
+            ticker_matched = updated_master.at[idx, 'ticker']
+            old_p = float(updated_master.at[idx, 'last_traded_price'])
+
+            # Handle amortised face values (e.g. NHIT InvIT amortised down to ₹300)
+            if 'NHIT' in sym or ('NHIT' in str(ticker_matched).upper()):
+                updated_master.at[idx, 'face_value'] = 300.0
+
+            updated_master.at[idx, 'last_traded_price'] = eff_price
+            fv = float(updated_master.at[idx, 'face_value'])
+            c = float(updated_master.at[idx, 'coupon_rate'])
+            freq = str(updated_master.at[idx, 'payment_frequency'])
+            mat_dt = pd.to_datetime(updated_master.at[idx, 'maturity_date']).date()
+            issue_dt = pd.to_datetime(updated_master.at[idx, 'issue_date']).date()
+            tenor = max(0.01, (mat_dt - today_d).days / 365.25)
+
+            acc = calculate_accrued_interest(fv, c, freq, issue_dt, mat_dt, today_d)
+            dirty = round(eff_price + acc, 2)
+            ytm = calculate_ytm_from_price(eff_price, fv, c, tenor, freq)
+
+            updated_master.at[idx, 'accrued_interest'] = acc
+            updated_master.at[idx, 'current_yield_ytm'] = ytm
+            updated_master.at[idx, 'last_traded_date'] = today_d.strftime('%Y-%m-%d')
+            matched_count += 1
+
+            audit_rows.append({
+                'Ticker': ticker_matched,
+                'Previous LTP': f"₹ {old_p:,.2f}",
+                'New Kite LTP': f"₹ {eff_price:,.2f}",
+                'Price Change': f"₹ {eff_price - old_p:+,.2f}",
+                'Accrued Interest': f"₹ {acc:,.2f}",
+                'Dirty Price': f"₹ {dirty:,.2f}",
+                'New YTM': f"{ytm:.2f}%",
+                'Portfolio Qty': int(qty_val) if qty_val > 0 else "—",
+                'Current Value': f"₹ {cur_val:,.2f}" if cur_val > 0 else (f"₹ {qty_val * eff_price:,.2f}" if qty_val > 0 else "—")
+            })
+
+        audit_df = pd.DataFrame(audit_rows) if audit_rows else pd.DataFrame()
+        msg = f"Successfully matched and synced {matched_count} Zerodha Kite holdings quotes into master screener."
+        return updated_master, msg, audit_df
+    except Exception as e:
+        return master_df, f"Error parsing Zerodha Kite holdings: {e}", pd.DataFrame()
+
 
 def load_sample_csv(path: str = "data/sample_bonds.csv") -> pd.DataFrame:
     try:
