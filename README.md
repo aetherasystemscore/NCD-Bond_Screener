@@ -1,5 +1,12 @@
 # 🇮🇳 Indian Listed NCD, G-Sec & Corporate Bond Screener
 
+<!-- LIVE_STREAMLIT_APP_BANNER_START -->
+[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://ncd-bond-screener.streamlit.app/)
+
+> **🚀 Live Streamlit App:** [**https://ncd-bond-screener.streamlit.app/**](https://ncd-bond-screener.streamlit.app/)
+<!-- LIVE_STREAMLIT_APP_BANNER_END -->
+
+
 A high-performance Python & Streamlit institutional analytics screener for secondary market Non-Convertible Debentures (NCDs), Government Securities (G-Secs), and listed corporate bonds in India.
 
 ## Features
